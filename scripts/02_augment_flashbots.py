@@ -18,8 +18,8 @@ What it does:
      and removed.
   2. Augment: add the Flashbots blocks that Xatu does not have to the Xatu table from step 1. Xatu rows win
      when a block is in both. Output: data/interim/df_blocks_builder_augmented.parquet.
-  3. The Xatu-only table (data/interim/df_blocks_builder.parquet) has no other use, so it is deleted after the
-     augmented table is written. Use --keep-xatu-table to keep it.
+  Both tables stay in data/interim/: df_blocks_builder.parquet (Xatu only, from step 1) and
+  df_blocks_builder_augmented.parquet (Xatu plus Flashbots, read by step 5).
 
 Runtime: a first full download is about 15,000 to 20,000 requests (estimate from the first run), so several
 hours at one request per second. A monthly update is about a thousand requests.
@@ -167,7 +167,7 @@ def consolidate_flashbots() -> pl.DataFrame:
     return df
 
 
-def augment_xatu(df_flashbots: pl.DataFrame, keep_xatu_table: bool = False) -> None:
+def augment_xatu(df_flashbots: pl.DataFrame) -> None:
     """
     Union the Xatu table with the Flashbots blocks it does not have. One row per block_number; Xatu rows win
     because they carry more metadata.
@@ -217,18 +217,11 @@ def augment_xatu(df_flashbots: pl.DataFrame, keep_xatu_table: bool = False) -> N
     tmp.replace(AUGMENTED_OUT)
     print(f"  Saved -> {AUGMENTED_OUT}", flush=True)
 
-    if keep_xatu_table:
-        print(f"  Kept the Xatu-only table (--keep-xatu-table): {XATU_FILE}", flush=True)
-    else:
-        XATU_FILE.unlink()
-        print(f"  Removed the Xatu-only table, no longer needed: {XATU_FILE}", flush=True)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sync Flashbots relay data and add it to the Xatu relay table.")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="seconds between two requests")
     parser.add_argument("--no-download", action="store_true", help="skip the sync; use the local Flashbots file")
-    parser.add_argument("--keep-xatu-table", action="store_true", help="keep data/interim/df_blocks_builder.parquet")
     args = parser.parse_args()
 
     if not args.no_download:
@@ -237,7 +230,7 @@ def main() -> None:
     print("\n=== Consolidate ===", flush=True)
     df_flashbots = consolidate_flashbots()
     print("\n=== Augment the Xatu table with Flashbots ===", flush=True)
-    augment_xatu(df_flashbots, keep_xatu_table=args.keep_xatu_table)
+    augment_xatu(df_flashbots)
     print("\nDone.", flush=True)
 
 

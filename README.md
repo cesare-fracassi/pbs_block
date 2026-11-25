@@ -57,7 +57,7 @@ The stages run in this order and the run stops at the first failure. Every stage
 | Stage | Script | What it does | Rough time (estimates) |
 |---|---|---|---|
 | xatu | `01_download_xatu.py` | Downloads the daily Xatu files, one request every second, and builds the relay table | about 30 minutes for the 1,400 days |
-| flashbots | `02_augment_flashbots.py` | Fetches Flashbots delivered payloads (one request every second), adds the blocks Xatu lacks to the relay table, removes the Xatu-only table | several hours the first time (15,000 to 20,000 requests), then minutes |
+| flashbots | `02_augment_flashbots.py` | Fetches Flashbots delivered payloads (one request every second), adds the blocks Xatu lacks to the relay table | several hours the first time (15,000 to 20,000 requests), then minutes |
 | node | `03_extract_node_block_data.py` | Extracts `extra_data`, fee recipient and the last transaction of every block from the node | about 3 hours for the full range (about 1,000 blocks per second measured on 1,000 blocks) |
 | relayscan | `04_download_relayscan.py` | Downloads the daily relayscan counts, one request every second | about 30 minutes the first time |
 | build | `05_build_pbs_flag.py` | Combines the signals, writes `df_blocks_pbs.parquet` and the QC tables | minutes |
@@ -86,7 +86,7 @@ data/raw/flashbots/               Flashbots delivered payloads (df_blocks_flashb
 data/raw/node/                    block_inputs_<first>_<last>.parquet, 20,000 blocks each
 data/raw/builder_label_snapshots/ dated copies of the builder-name mapping
 data/raw/relayscan_daily.csv      relayscan daily counts
-data/interim/                     relay table with Flashbots blocks (df_blocks_builder_augmented.parquet)
+data/interim/                     relay tables: df_blocks_builder.parquet (Xatu) and df_blocks_builder_augmented.parquet (Xatu plus Flashbots)
 data/processed/                   df_blocks_pbs.parquet and the QC tables
 scripts/                          the build and the updater; _common.py holds shared paths and the paced downloader
 ```

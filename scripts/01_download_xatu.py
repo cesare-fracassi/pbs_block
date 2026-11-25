@@ -29,8 +29,8 @@ Relay names are already human-readable strings in the Xatu data (e.g. "flashbots
 "bloxroute_maxprofit", "ultrasound", "agnostic", "titan", "aestus").
 
 Output: data/raw/xatu/xatu_YYYY-MM-DD.parquet (one file per day)
-        data/interim/df_blocks_builder.parquet (merged, one row per block_number; consumed and
-        removed by step 2, which writes the table with Flashbots blocks added)
+        data/interim/df_blocks_builder.parquet (merged, one row per block_number; step 2 reads it and
+        writes the table with Flashbots blocks added)
 
 Downloads are sequential with a pause between requests (--delay, default 1 second), because the files come
 from a public server shared with other users. Finished days are skipped, so the script can be stopped and
