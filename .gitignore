@@ -1,0 +1,15 @@
+# Data (raw, interim and processed) is not versioned
+data/
+
+# Logs and caches written by the scripts
+*.log
+__pycache__/
+*.pyc
+
+# Credentials
+*.pem
+*.ppk
+config.txt
+.env
+gcp-key.json
+*-key.json
