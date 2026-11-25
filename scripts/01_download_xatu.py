@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 1 — Download block-builder and relay data from the Xatu public dataset
+Step 1: Download block-builder and relay data from the Xatu public dataset
 and build the block-level builder assignment table.
 
 Source:   https://data.ethpandaops.io/xatu/mainnet/databases/default/
@@ -28,25 +28,29 @@ Builder label sources, in priority order:
 Relay names are already human-readable strings in the Xatu data (e.g. "flashbots",
 "bloxroute_maxprofit", "ultrasound", "agnostic", "titan", "aestus").
 
-Output: PBS_DATA_DIR/raw/xatu/xatu_YYYY-MM-DD.parquet (one file per day)
-        PBS_DATA_DIR/raw/df_blocks_builder.parquet (merged, one row per block_number)
+Output: data/raw/xatu/xatu_YYYY-MM-DD.parquet (one file per day)
+        data/interim/df_blocks_builder.parquet (merged, one row per block_number; consumed and
+        removed by step 2, which writes the table with Flashbots blocks added)
+
+Downloads are sequential with a pause between requests (--delay, default 1 second), because the files come
+from a public server shared with other users. Finished days are skipped, so the script can be stopped and
+restarted. Run it from anywhere; paths are relative to the repository folder.
 
 Run:
-    export PBS_DATA_DIR=/path/to/crypto_data/PBS/data
-    python 01_download_xatu.py              # download + build in one pass
-    python 01_download_xatu.py --step download
-    python 01_download_xatu.py --step build
+    python scripts/01_download_xatu.py              # download + build in one pass
+    python scripts/01_download_xatu.py --step download
+    python scripts/01_download_xatu.py --step build
+    python scripts/01_download_xatu.py --end 2026-10-31      # stop at a given day
 """
 import argparse
 import io
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
-import requests
+
+from _common import DATA_DIR, DEFAULT_DELAY, INTERIM_DIR, MERGE_DATE, RAW_DIR, HostBlocked, pivot_compat, polite_get
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,11 +58,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-DATA_DIR = Path(os.environ.get("PBS_DATA_DIR", "./data"))
-RAW_DIR = DATA_DIR / "raw"
-
-MERGE_DATE = date(2022, 9, 15)
 
 XATU_BASE = (
     "https://data.ethpandaops.io/xatu/mainnet/databases/default"
@@ -133,17 +132,18 @@ def _decode_xatu_df(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def _fetch_day(d: date, xatu_dir: Path) -> int:
-    """Download and save one day's Xatu parquet. Returns rows saved (0 = skipped)."""
+def _fetch_day(d: date, xatu_dir: Path, delay: float) -> int:
+    """Download and save one day's Xatu parquet. Returns rows saved (0 = skipped or no data)."""
     out = xatu_dir / f"xatu_{d.isoformat()}.parquet"
     if out.exists():
         return 0  # already done, resumable
 
     url = f"{XATU_BASE}/{d.year}/{d.month}/{d.day}.parquet"
     try:
-        resp = requests.get(url, timeout=60)
+        resp = polite_get(url, delay=delay, timeout=120)
         if resp.status_code == 404:
-            return 0  # no data for this date (future or gap)
+            log.warning(f"Xatu {d}: no file on the server (404)")
+            return 0
         if resp.status_code != 200:
             log.warning(f"Xatu {d}: HTTP {resp.status_code}")
             return 0
@@ -152,18 +152,22 @@ def _fetch_day(d: date, xatu_dir: Path) -> int:
             return 0
         df = _decode_xatu_df(df)
         df = df.with_columns(pl.lit(str(d)).alias("date"))
-        df.write_parquet(out, compression="zstd")
+        tmp = out.with_suffix(".parquet.tmp")
+        df.write_parquet(tmp, compression="zstd")
+        tmp.replace(out)
         return len(df)
+    except HostBlocked:
+        raise
     except Exception as e:
         log.warning(f"Xatu {d}: {e}")
         return 0
 
 
-def download_xatu(start_date: str = "2022-09-15", end_date: str | None = None, n_workers: int = 16) -> int:
+def download_xatu(start_date: str = "2022-09-15", end_date: str | None = None, delay: float = DEFAULT_DELAY) -> int:
     """
-    Download the full Xatu mev_relay_proposer_payload_delivered dataset.
-    Daily files are fetched in parallel and saved to raw/xatu/.
-    Already-downloaded files are skipped (safe to re-run / resume).
+    Download the Xatu mev_relay_proposer_payload_delivered daily files into data/raw/xatu/.
+    One request at a time, `delay` seconds apart. Days already on disk are skipped (safe to re-run).
+    The default end is two days before today, because the newest days are not published yet.
     Returns total rows saved.
     """
     xatu_dir = RAW_DIR / "xatu"
@@ -172,26 +176,22 @@ def download_xatu(start_date: str = "2022-09-15", end_date: str | None = None, n
     start = datetime.strptime(start_date, "%Y-%m-%d").date()
     end = (date.today() - timedelta(days=2)) if end_date is None else datetime.strptime(end_date, "%Y-%m-%d").date()
 
-    all_dates = []
+    todo = []
     d = start
     while d <= end:
-        all_dates.append(d)
+        if not (xatu_dir / f"xatu_{d.isoformat()}.parquet").exists():
+            todo.append(d)
         d += timedelta(days=1)
 
-    log.info(f"Xatu download: {len(all_dates)} days ({start} - {end}), {n_workers} parallel workers")
+    log.info(f"Xatu download: {len(todo)} days to fetch between {start} and {end}, one request every {delay:g} s")
 
     total_rows = 0
-    done_count = 0
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_fetch_day, d, xatu_dir): d for d in all_dates}
-        for future in as_completed(futures):
-            n = future.result()
-            total_rows += n
-            done_count += 1
-            if done_count % 100 == 0:
-                log.info(f"Xatu: {done_count}/{len(all_dates)} days done, {total_rows:,} rows so far")
+    for i, d in enumerate(todo, start=1):
+        total_rows += _fetch_day(d, xatu_dir, delay)
+        if i % 100 == 0:
+            log.info(f"Xatu: {i}/{len(todo)} days done, {total_rows:,} rows so far")
 
-    log.info(f"Xatu download complete: {total_rows:,} rows, {done_count} days processed")
+    log.info(f"Xatu download complete: {total_rows:,} rows, {len(todo)} days processed")
     return total_rows
 
 
@@ -210,7 +210,7 @@ def _load_builder_labels() -> dict[str, str]:
     dated snapshot locally every time we fetch, before using it.
     """
     try:
-        resp = requests.get(BUILDER_LABELS_URL, timeout=20)
+        resp = polite_get(BUILDER_LABELS_URL, timeout=30)
         resp.raise_for_status()
 
         snapshot_dir = DATA_DIR / "raw" / "builder_label_snapshots"
@@ -281,8 +281,8 @@ def build_blocks_table() -> pl.DataFrame:
     winning = winning.with_columns(
         (pl.col("relay").cum_count().over("block_number")).alias("relay_rank")
     )
-    relay_wide = winning.pivot(
-        columns="relay_rank", index="block_number", values="relay", aggregate_function="first"
+    relay_wide = pivot_compat(
+        winning, on="relay_rank", index="block_number", values="relay", aggregate_function="first"
     ).rename(lambda c: f"relay_{c}" if c != "block_number" else c)
 
     agg = canonical.join(relay_wide, on="block_number", how="left").sort("block_number")
@@ -326,7 +326,8 @@ def build_blocks_table() -> pl.DataFrame:
     core_cols = [c for c in core_order if c in agg.columns]
     agg = agg.select(core_cols + relay_cols)
 
-    out_path = RAW_DIR / "df_blocks_builder.parquet"
+    INTERIM_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = INTERIM_DIR / "df_blocks_builder.parquet"
     agg.write_parquet(out_path, compression="zstd")
     log.info(f"Saved df_blocks_builder.parquet: {len(agg):,} rows -> {out_path}")
 
@@ -346,11 +347,13 @@ def build_blocks_table() -> pl.DataFrame:
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Download Xatu relay payload days and build the relay table.")
     parser.add_argument("--step", choices=["download", "build", "all"], default="all")
+    parser.add_argument("--end", default=None, metavar="YYYY-MM-DD", help="last day to download (default: two days ago)")
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="seconds between two requests")
     args = parser.parse_args()
     if args.step in ("download", "all"):
-        download_xatu()
+        download_xatu(end_date=args.end, delay=args.delay)
     if args.step in ("build", "all"):
         build_blocks_table()
 

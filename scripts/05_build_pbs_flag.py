@@ -7,26 +7,25 @@ QC. No input is deleted or modified; this script only reads its inputs and
 writes a new output file.
 
 Input files (must exist before running):
-    PBS_DATA_DIR/raw/df_blocks_builder_augmented.parquet   (step 2: Xatu + Flashbots)
-    PBS_DATA_DIR/raw/bq/block_extra_data.parquet           (step 3)
-    PBS_DATA_DIR/raw/bq/block_last_tx.parquet              (step 4, optional but recommended)
+    data/interim/df_blocks_builder_augmented.parquet   (step 2: Xatu + Flashbots relay blocks)
+    data/raw/node/block_inputs_*.parquet               (step 3: extra_data, fee recipient, last transaction)
 
-Optional, for QC coverage comparison:
-    PBS_DATA_DIR/raw/relayscan_daily.csv
+Optional, for the coverage comparison in the QC report:
+    data/raw/relayscan_daily.csv                       (step 4)
+
+The output covers exactly the blocks in the step 3 files: relay blocks outside that range are ignored, so the
+dataset never has a tail of blocks that only the relay data knows about.
 
 Output:
-    PBS_DATA_DIR/processed/df_blocks_pbs.parquet       final, shared schema:
+    data/processed/df_blocks_pbs.parquet       final, shared schema:
         block_number, is_pbs, builder_address, builder_name
-        (block_timestamp and validator_address are deliberately NOT included -
-        both come only from the BigQuery pull below, which is not refreshed
-        on a routine update, so they would silently go stale/null for every
-        block added after the last BigQuery run)
-    PBS_DATA_DIR/processed/df_blocks_pbs_full.parquet  full intermediate table
-        (every source column kept, including block_timestamp/fee_recipient)
-        for internal QC, not meant for sharing
-    PBS_DATA_DIR/processed/pbs_flag_qc_sources.csv
-    PBS_DATA_DIR/processed/pbs_flag_qc_monthly.csv
-    PBS_DATA_DIR/processed/pbs_flag_qc_relayscan.csv
+        (block_timestamp and the fee recipient are deliberately NOT included in the shared file; they are
+        available from any node)
+    data/processed/df_blocks_pbs_full.parquet  only with --keep-full: the full intermediate table (every
+        source column kept) for internal checks, not meant for sharing
+    data/processed/pbs_flag_qc_sources.csv     blocks per classification source and extra_data class
+    data/processed/pbs_flag_qc_monthly.csv     blocks per month and classification source
+    data/processed/pbs_flag_qc_relayscan.csv   only when step 4 has run: monthly coverage against relayscan.io
 
 PBS source priority
 --------------------
@@ -46,19 +45,20 @@ concentrated in late-2022 BloXroute blocks whose relay API data was purged
 before any pipeline could capture it.
 
 Run:
-    export PBS_DATA_DIR=/path/to/crypto_data/PBS/data
-    python 05_build_pbs_flag.py
+    python scripts/05_build_pbs_flag.py
+    python scripts/05_build_pbs_flag.py --keep-full          # also write the full intermediate table
+    python scripts/05_build_pbs_flag.py --out some.parquet   # write the final file elsewhere (used by update_month.py)
 """
+import argparse
 import os
 import re
 from pathlib import Path
 
 import polars as pl
 
-DATA_DIR = Path(os.environ.get("PBS_DATA_DIR", "./data"))
-RAW_DIR = DATA_DIR / "raw"
-BQ_DIR = RAW_DIR / "bq"
-PROCESSED_DIR = DATA_DIR / "processed"
+from _common import INTERIM_DIR, PROCESSED_DIR, RAW_DIR, pivot_compat
+
+NODE_GLOB = str(RAW_DIR / "node" / "block_inputs_*.parquet")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 OUT_FILE = PROCESSED_DIR / "df_blocks_pbs.parquet"
@@ -184,7 +184,7 @@ def hex_to_utf8(h: str | None) -> str | None:
 
 
 def load_relay_blocks() -> pl.DataFrame:
-    aug_file = RAW_DIR / "df_blocks_builder_augmented.parquet"
+    aug_file = INTERIM_DIR / "df_blocks_builder_augmented.parquet"
     if not aug_file.exists():
         raise FileNotFoundError(f"{aug_file} not found. Run 02_augment_flashbots.py first.")
 
@@ -216,16 +216,24 @@ def load_relay_blocks() -> pl.DataFrame:
 
 
 def load_extra_data() -> pl.DataFrame:
-    ed_file = BQ_DIR / "block_extra_data.parquet"
-    if not ed_file.exists():
-        raise FileNotFoundError(f"{ed_file} not found. Run 03_download_block_extra_data.py first.")
+    """Block header fields (timestamp, extra_data, fee recipient) from the step 3 node files."""
+    if not list(Path(NODE_GLOB).parent.glob(Path(NODE_GLOB).name)):
+        raise FileNotFoundError(f"No {NODE_GLOB} files found. Run 03_extract_node_block_data.py first.")
 
-    print("Loading block_extra_data.parquet ...", flush=True)
-    ed = pl.read_parquet(ed_file)
+    print("Loading block header fields from the node files ...", flush=True)
+    ed = (
+        pl.scan_parquet(NODE_GLOB)
+        .select(["block_number", "block_timestamp", "extra_data_hex", "fee_recipient"])
+        .collect()
+        .with_columns(pl.from_epoch(pl.col("block_timestamp"), time_unit="s").alias("block_timestamp"))
+        .sort("block_number")
+    )
+    n_dup = len(ed) - ed["block_number"].n_unique()
+    if n_dup:
+        raise ValueError(f"{n_dup:,} duplicated block numbers in the node files")
 
-    if "extra_data_utf8" not in ed.columns:
-        utf8_vals = [hex_to_utf8(v) for v in ed["extra_data_hex"].to_list()]
-        ed = ed.with_columns(pl.Series("extra_data_utf8", utf8_vals))
+    utf8_vals = [hex_to_utf8(v) for v in ed["extra_data_hex"].to_list()]
+    ed = ed.with_columns(pl.Series("extra_data_utf8", utf8_vals))
 
     classes = [classify_extra_data(v) for v in ed["extra_data_utf8"].to_list()]
     builder_ids = [first_builder_match(v) for v in ed["extra_data_utf8"].to_list()]
@@ -241,17 +249,18 @@ def load_extra_data() -> pl.DataFrame:
     return ed
 
 
-def load_last_tx(ed: pl.DataFrame) -> pl.DataFrame | None:
-    lt_file = BQ_DIR / "block_last_tx.parquet"
-    if not lt_file.exists():
-        print("  (block_last_tx.parquet not found, skipping last-tx signal. Run 04_download_last_tx.py first.)")
-        return None
-
-    print("Loading block_last_tx.parquet ...", flush=True)
-    lt = pl.read_parquet(lt_file, columns=[
-        "block_number", "transaction_index", "from_address", "to_address", "value", "receipt_gas_used",
-    ])
-    print(f"  {len(lt):,} blocks with last-tx data", flush=True)
+def load_last_tx(ed: pl.DataFrame) -> pl.DataFrame:
+    """Last transaction of each non-empty block, from the step 3 node files."""
+    print("Loading last-transaction fields from the node files ...", flush=True)
+    lt = (
+        pl.scan_parquet(NODE_GLOB)
+        .filter(pl.col("n_tx") > 0)
+        .select(["block_number", "transaction_index", "from_address", "to_address", "value", "receipt_gas_used"])
+        .collect()
+        # value is stored as an exact decimal string of wei; the signal only needs it as a number
+        .with_columns(pl.col("value").cast(pl.Float64))
+    )
+    print(f"  {len(lt):,} blocks with a last transaction", flush=True)
 
     lt = lt.with_columns(pl.col("block_number").cast(pl.Int64)).join(
         ed.select(["block_number", "fee_recipient"]).with_columns(pl.col("block_number").cast(pl.Int64)),
@@ -410,9 +419,24 @@ def run_qc(combined: pl.DataFrame) -> None:
     for row in top_builders.iter_rows(named=True):
         print(f"  {str(row['extra_data_builder_id']):25s}: {row['n_blocks']:>9,}")
 
+    # These two tables do not depend on relayscan, so they are written whether or not step 4 has run.
+    src_qc = combined.group_by(["pbs_source", "extra_data_class"]).agg(pl.len().alias("n"))
+    src_qc.write_csv(PROCESSED_DIR / "pbs_flag_qc_sources.csv")
+
+    monthly_src = pivot_compat(
+        combined.filter(pl.col("block_timestamp").is_not_null())
+        .with_columns(pl.col("block_timestamp").dt.strftime("%Y-%m").alias("month"))
+        .group_by(["month", "pbs_source"])
+        .agg(pl.len().alias("n"))
+        .sort(["month", "pbs_source"]),
+        on="pbs_source", index="month", values="n", aggregate_function="sum",
+    ).fill_null(0).sort("month")
+    monthly_src.write_csv(PROCESSED_DIR / "pbs_flag_qc_monthly.csv")
+    print(f"\nQC tables saved to {PROCESSED_DIR}")
+
     rs_cache = RAW_DIR / "relayscan_daily.csv"
     if not rs_cache.exists():
-        print("\n  (relayscan_daily.csv not found, skipping coverage QC)")
+        print("\n  (relayscan_daily.csv not found, skipping coverage QC. Run 04_download_relayscan.py to create it.)")
         return
 
     print("\n--- Monthly coverage vs relayscan.io (PBS blocks only) ---")
@@ -446,28 +470,23 @@ def run_qc(combined: pl.DataFrame) -> None:
     total_our = cov["our_blocks"].sum()
     print(f"\n  Overall coverage: {total_our:,} / {total_rs:,} = {total_our / total_rs * 100:.1f}%")
 
-    src_qc = combined.group_by(["pbs_source", "extra_data_class"]).agg(pl.len().alias("n"))
-    src_qc.write_csv(PROCESSED_DIR / "pbs_flag_qc_sources.csv")
-
-    monthly_src = (
-        combined.filter(pl.col("block_timestamp").is_not_null())
-        .with_columns(pl.col("block_timestamp").dt.strftime("%Y-%m").alias("month"))
-        .group_by(["month", "pbs_source"])
-        .agg(pl.len().alias("n"))
-        .sort(["month", "pbs_source"])
-        .pivot(columns="pbs_source", index="month", values="n", aggregate_function="sum")
-        .fill_null(0)
-        .sort("month")
-    )
-    monthly_src.write_csv(PROCESSED_DIR / "pbs_flag_qc_monthly.csv")
     cov.write_csv(PROCESSED_DIR / "pbs_flag_qc_relayscan.csv")
-    print(f"\nQC tables saved to {PROCESSED_DIR}")
+    print(f"Coverage table saved to {PROCESSED_DIR / 'pbs_flag_qc_relayscan.csv'}")
 
 
-def main() -> None:
+def main(keep_full: bool = False, out_file: Path = OUT_FILE) -> None:
     relay = load_relay_blocks()
     ed = load_extra_data()
     lt = load_last_tx(ed)
+
+    # The dataset covers exactly the blocks the node files cover. Relay data can run ahead of them (Xatu and
+    # Flashbots are fetched up to the newest day), and a block that only the relay data knows about would
+    # leave a tail of PBS blocks with no matching non-PBS blocks.
+    first_block, last_block = ed["block_number"].min(), ed["block_number"].max()
+    n_before = len(relay)
+    relay = relay.filter(pl.col("block_number").is_between(first_block, last_block))
+    print(f"\nBlock range of the node files: {first_block:,} - {last_block:,}; "
+          f"{n_before - len(relay):,} relay blocks outside it ignored", flush=True)
     combined = build_pbs_flag(relay, ed, lt)
 
     run_qc(combined)
@@ -498,20 +517,16 @@ def main() -> None:
     n_named = sum(1 for c in builder_name if c is not None)
     print(f"  {n_named:,} blocks with a builder name ({n_named / len(combined) * 100:.1f}%)", flush=True)
 
-    # Full QC/intermediate table (all source columns) kept for our own
-    # validation - not the file meant for sharing.
-    out_cols = [c for c in combined.columns if c != "extra_data_utf8"]
-    qc_file = PROCESSED_DIR / "df_blocks_pbs_full.parquet"
-    combined.select(out_cols).write_parquet(qc_file, compression="zstd")
-    print(f"Saved full QC table -> {qc_file}")
+    # Full intermediate table (all source columns), only on request: nothing in the pipeline reads it.
+    if keep_full:
+        out_cols = [c for c in combined.columns if c != "extra_data_utf8"]
+        qc_file = PROCESSED_DIR / "df_blocks_pbs_full.parquet"
+        combined.select(out_cols).write_parquet(qc_file, compression="zstd")
+        print(f"Saved full intermediate table (--keep-full) -> {qc_file}")
 
-    # block_timestamp and validator_address (fee_recipient) are dropped from
-    # the final schema: both come exclusively from block_extra_data.parquet
-    # (the BigQuery pull), not from Xatu/Flashbots, and by policy that file
-    # is not refreshed as part of a routine update - so both fields would be
-    # null for every block added after the last BigQuery pull, silently
-    # growing out of date with every update. Keeping only fields the free,
-    # routinely-updated sources (Xatu, Flashbots) can always populate.
+    # The shared file keeps only the classification and the builder. The block timestamp and the fee
+    # recipient are left out on purpose: any node has them, and they would be one more thing to keep
+    # in sync with each update.
     print("\nBuilding the final, shared schema: block_number, is_pbs, "
           "builder_address, builder_name ...", flush=True)
     final = (
@@ -520,11 +535,26 @@ def main() -> None:
         .select(["block_number", "is_pbs", "builder_address", "builder_name"])
         .sort("block_number")
     )
-    final.write_parquet(OUT_FILE, compression="zstd")
-    size_mb = OUT_FILE.stat().st_size / 1e6
-    print(f"\nSaved -> {OUT_FILE}  ({size_mb:.0f} MB  |  {len(final):,} blocks)")
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_file.with_name(out_file.name + ".tmp")
+    final.write_parquet(tmp, compression="zstd")
+    os.replace(tmp, out_file)
+    size_mb = out_file.stat().st_size / 1e6
+    print(f"\nSaved -> {out_file}  ({size_mb:.0f} MB  |  {len(final):,} blocks, "
+          f"{final['block_number'].min():,} - {final['block_number'].max():,})")
     print("Done.", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Build the definitive PBS flag per block.")
+    parser.add_argument(
+        "--keep-full", action="store_true",
+        help="also write processed/df_blocks_pbs_full.parquet (every source column; not needed by anything)",
+    )
+    parser.add_argument(
+        "--out", type=Path, default=OUT_FILE,
+        help="where to write the final file (default: data/processed/df_blocks_pbs.parquet)",
+    )
+    args = parser.parse_args()
+    main(keep_full=args.keep_full, out_file=args.out)

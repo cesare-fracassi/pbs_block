@@ -1,73 +1,56 @@
 #!/usr/bin/env python3
 """
-Step 2 - Augment df_blocks_builder (Xatu) with Flashbots relay API data.
+Step 2 - Add Flashbots relay API data to the Xatu relay table.
 
-Problem: Xatu relay data has severe coverage gaps in the early post-Merge period.
-  - Xatu starts Nov 25 2022 (block 16,050,384); Sep-Nov 2022 has zero coverage.
-  - Even after Xatu starts, only about 2% of blocks are classified PBS in Nov
-    2022, growing slowly, because Xatu was adding relays to its collection
-    over time.
-  - Flashbots (the dominant relay in 2022-2023, roughly 75% PBS market share)
-    is almost entirely missing from Xatu's early data.
+Why: Xatu's relay data has coverage gaps, mostly in the months after the Merge.
+  - Xatu starts Nov 25 2022 (block 16,050,384); Sep to Nov 2022 has no coverage.
+  - After it starts, only about 2% of blocks are classified PBS in Nov 2022, growing slowly, because
+    Xatu was adding relays to its collection over time.
+  - Flashbots (roughly 75% of PBS blocks in 2022 and 2023) is almost missing from Xatu's early data.
+The Flashbots relay API has the complete delivered-payload history from roughly slot 4,800,000
+(Sep 29, 2022) to the present.
 
-Solution: query the Flashbots relay API directly.
-  - The Flashbots API has complete delivered-payload history from roughly
-    slot 4,800,000 (Sep 29, 2022) through the present.
-  - Anti-join against Xatu to find blocks Xatu missed.
-  - Union: df_blocks_builder (Xatu) union Flashbots-only blocks.
+What it does:
+  1. Sync: fetch the delivered payloads the API has and the local file lacks. Pages are read from the newest
+     slot backwards, one request every --delay seconds (default 1.0), until the newest slot already saved
+     (or START_SLOT on the first run). Pages are staged in data/raw/flashbots_batches/ so an interrupted run
+     continues where it stopped; the staging files are merged into data/raw/flashbots/df_blocks_flashbots.parquet
+     and removed.
+  2. Augment: add the Flashbots blocks that Xatu does not have to the Xatu table from step 1. Xatu rows win
+     when a block is in both. Output: data/interim/df_blocks_builder_augmented.parquet.
+  3. The Xatu-only table (data/interim/df_blocks_builder.parquet) has no other use, so it is deleted after the
+     augmented table is written. Use --keep-xatu-table to keep it.
 
-Validation: relayscan.io /stats/day/YYYY-MM-DD/json provides known relay
-  payload counts per day since the Merge; used here to spot-check coverage.
-
-Runtime: roughly 1-2 hours (15,000-20,000 API calls at a 0.15s/call rate limit).
-Checkpointed: safe to kill and resume; batch files accumulate on disk.
-
-Output:
-  PBS_DATA_DIR/raw/flashbots_batches/      staging batch parquets (temporary)
-  PBS_DATA_DIR/raw/flashbots/df_blocks_flashbots.parquet   all Flashbots data
-  PBS_DATA_DIR/raw/df_blocks_builder_augmented.parquet     Xatu + Flashbots, deduped
+Runtime: a first full download is about 15,000 to 20,000 requests (estimate from the first run), so several
+hours at one request per second. A monthly update is about a thousand requests.
 
 Run:
-    export PBS_DATA_DIR=/path/to/crypto_data/PBS/data
-    python 02_augment_flashbots.py --step 1   # download
-    python 02_augment_flashbots.py --step 2   # consolidate
-    python 02_augment_flashbots.py --step 3   # merge with Xatu + validate
+    python scripts/02_augment_flashbots.py
+    python scripts/02_augment_flashbots.py --delay 2     # slower
+    python scripts/02_augment_flashbots.py --no-download # only rebuild the augmented table
 """
-import os
+import argparse
 import sys
-import time
-from pathlib import Path
 
 import polars as pl
-import requests
 
-DATA_DIR = Path(os.environ.get("PBS_DATA_DIR", "./data"))
-RAW_DIR = DATA_DIR / "raw"
+from _common import DEFAULT_DELAY, INTERIM_DIR, RAW_DIR, polite_get
 
 FLASHBOTS_URL = "https://boost-relay.flashbots.net/relay/v1/data/bidtraces/proposer_payload_delivered"
 START_SLOT = 4_800_000  # roughly Sep 29, 2022, earliest Flashbots data confirmed
-REQUEST_DELAY = 0.15  # seconds between API calls (roughly 6-7 req/s)
-SAVE_EVERY = 200  # API calls between checkpoint saves (roughly 20,000 records)
+SAVE_EVERY = 200  # requests between staging saves (roughly 20,000 records)
 
 BATCH_DIR = RAW_DIR / "flashbots_batches"
 FLASHBOTS_OUT = RAW_DIR / "flashbots" / "df_blocks_flashbots.parquet"
-AUGMENTED_OUT = RAW_DIR / "df_blocks_builder_augmented.parquet"
-XATU_FILE = RAW_DIR / "df_blocks_builder.parquet"
+XATU_FILE = INTERIM_DIR / "df_blocks_builder.parquet"
+AUGMENTED_OUT = INTERIM_DIR / "df_blocks_builder_augmented.parquet"
 
 
-def fetch_batch(cursor: int, limit: int = 100) -> list[dict]:
-    """Fetch one page of delivered payloads (slot <= cursor), descending."""
-    for attempt in range(5):
-        try:
-            r = requests.get(FLASHBOTS_URL, params={"cursor": str(cursor), "limit": limit}, timeout=30)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            wait = 2 ** attempt
-            print(f"  Retry {attempt + 1}/5 at cursor={cursor:,}: {e}. Waiting {wait}s", flush=True)
-            time.sleep(wait)
-    print(f"  All retries failed at cursor={cursor:,}. Skipping.", flush=True)
-    return []
+def fetch_batch(cursor: int, limit: int = 100, delay: float = DEFAULT_DELAY) -> list[dict]:
+    """One page of delivered payloads with slot <= cursor, newest first. Raises on a failed request."""
+    r = polite_get(FLASHBOTS_URL, delay=delay, timeout=30, params={"cursor": str(cursor), "limit": limit})
+    r.raise_for_status()
+    return r.json()
 
 
 def records_to_df(records: list[dict]) -> pl.DataFrame:
@@ -85,122 +68,122 @@ def records_to_df(records: list[dict]) -> pl.DataFrame:
     ])
 
 
-def download_flashbots() -> None:
+def _flush_batch(records: list[dict], batch_idx: int) -> None:
+    BATCH_DIR.mkdir(parents=True, exist_ok=True)
+    path = BATCH_DIR / f"batch_{batch_idx:05d}.parquet"
+    tmp = path.with_suffix(".parquet.tmp")
+    records_to_df(records).write_parquet(tmp, compression="zstd")
+    tmp.replace(path)
+    print(f"  -> staged batch {batch_idx:05d} ({len(records):,} records)", flush=True)
+
+
+def sync_flashbots(delay: float) -> None:
     """
-    Paginate the Flashbots relay API backwards (newest to oldest) down to
-    START_SLOT. Checkpoints every SAVE_EVERY calls into numbered batch
-    parquets in BATCH_DIR. Safe to kill and re-run; resumes from the minimum
-    slot already saved.
+    Fetch every delivered payload newer than what FLASHBOTS_OUT holds (all of them if it does not exist yet),
+    walking back from the newest slot. Staged in BATCH_DIR; call consolidate_flashbots() afterwards.
     """
     BATCH_DIR.mkdir(parents=True, exist_ok=True)
-    existing_batches = sorted(BATCH_DIR.glob("batch_*.parquet"))
-
-    if existing_batches:
-        min_slot = min(pl.scan_parquet(f).select(pl.col("slot").min()).collect().item() for f in existing_batches)
-        cursor = min_slot - 1
-        n_batches = len(existing_batches)
-        n_total = sum(pl.scan_parquet(f).select(pl.len()).collect().item() for f in existing_batches)
-        print(f"Resuming: {n_batches} batches, {n_total:,} records, next cursor={cursor:,}", flush=True)
+    if FLASHBOTS_OUT.exists():
+        stop_slot = pl.scan_parquet(FLASHBOTS_OUT).select(pl.col("slot").max()).collect().item()
+        print(f"Local Flashbots file goes up to slot {stop_slot:,}; fetching newer slots.", flush=True)
     else:
-        latest = fetch_batch(cursor=99_999_999, limit=1)
+        stop_slot = START_SLOT - 1
+        print(f"No local Flashbots file; fetching everything from slot {START_SLOT:,}.", flush=True)
+
+    batches = sorted(BATCH_DIR.glob("batch_*.parquet"))
+    if batches:
+        min_slot = min(pl.scan_parquet(f).select(pl.col("slot").min()).collect().item() for f in batches)
+        n_batches = len(batches)
+        n_total = sum(pl.scan_parquet(f).select(pl.len()).collect().item() for f in batches)
+        cursor = min_slot - 1
+        print(f"Resuming: {n_batches} staged batches, {n_total:,} records, next cursor {cursor:,}", flush=True)
+    else:
+        latest = fetch_batch(cursor=99_999_999, limit=1, delay=delay)
         if not latest:
-            print("ERROR: could not fetch latest slot from Flashbots API.", flush=True)
-            sys.exit(1)
+            sys.exit("ERROR: could not fetch the latest slot from the Flashbots API.")
         cursor = int(latest[0]["slot"])
-        n_batches = 0
-        n_total = 0
-        print(f"Starting fresh from slot {cursor:,}", flush=True)
+        n_batches = n_total = 0
+        print(f"Newest slot on the relay: {cursor:,}", flush=True)
+        if cursor <= stop_slot:
+            print("Already up to date.", flush=True)
+            return
 
     pending: list[dict] = []
     n_calls = 0
-    consecutive_empty = 0
-    MAX_EMPTY_SKIP = 10
-    EMPTY_SLOT_SKIP = 500
-
-    while cursor >= START_SLOT:
-        batch = fetch_batch(cursor)
-
-        if not batch:
-            consecutive_empty += 1
-            print(f"  Empty at cursor={cursor:,}, skip #{consecutive_empty}/{MAX_EMPTY_SKIP} (skipping back {EMPTY_SLOT_SKIP} slots)", flush=True)
-            if consecutive_empty >= MAX_EMPTY_SKIP:
-                print(f"  {MAX_EMPTY_SKIP} consecutive empty responses, stopping download.", flush=True)
-                break
-            cursor -= EMPTY_SLOT_SKIP
-            time.sleep(1.0)
-            continue
-
-        consecutive_empty = 0
-
-        batch = [r for r in batch if int(r["slot"]) >= START_SLOT]
-        if not batch:
-            print(f"  Reached START_SLOT ({START_SLOT:,}), download complete.", flush=True)
+    while cursor > stop_slot:
+        page = fetch_batch(cursor, delay=delay)
+        if not page:
+            # Nothing older than the cursor: this is the start of the history the API serves.
+            print(f"  No records at or below slot {cursor:,}; treating this as the start of the available history.", flush=True)
             break
-
-        pending.extend(batch)
+        page = [r for r in page if int(r["slot"]) > stop_slot]
+        if not page:
+            print(f"  Reached the slot already saved ({stop_slot:,}).", flush=True)
+            break
+        pending.extend(page)
         n_calls += 1
-        n_total += len(batch)
-        cursor = min(int(r["slot"]) for r in batch) - 1
-
+        n_total += len(page)
+        cursor = min(int(r["slot"]) for r in page) - 1
         if n_calls % 100 == 0:
-            print(f"  [{n_calls:,} calls] cursor={cursor:,} | records={n_total:,} | batches={n_batches}", flush=True)
-
+            print(f"  [{n_calls:,} requests] cursor {cursor:,} | records {n_total:,} | staged batches {n_batches}", flush=True)
         if n_calls % SAVE_EVERY == 0:
             _flush_batch(pending, n_batches)
             n_batches += 1
             pending = []
 
-        time.sleep(REQUEST_DELAY)
-
     if pending:
         _flush_batch(pending, n_batches)
         n_batches += 1
-
-    print(f"\nDownload complete: {n_total:,} records in {n_batches} batch files.", flush=True)
-
-
-def _flush_batch(records: list[dict], batch_idx: int) -> None:
-    path = BATCH_DIR / f"batch_{batch_idx:05d}.parquet"
-    records_to_df(records).write_parquet(path, compression="zstd")
-    print(f"  -> Saved batch {batch_idx:05d} ({len(records):,} records) to {path.name}", flush=True)
+    print(f"Sync complete: {n_total:,} new records in {n_batches} staged batches.", flush=True)
 
 
 def consolidate_flashbots() -> pl.DataFrame:
-    """Concat all batch files, deduplicate on block_number, save to FLASHBOTS_OUT."""
+    """
+    Merge the staged batches into FLASHBOTS_OUT (existing rows kept), one row per block_number, then remove the
+    staging files this run produced.
+    """
     FLASHBOTS_OUT.parent.mkdir(parents=True, exist_ok=True)
     batch_files = sorted(BATCH_DIR.glob("batch_*.parquet"))
-    if not batch_files:
-        print("No batch files found. Run step 1 first.", flush=True)
-        sys.exit(1)
+    parts = [pl.read_parquet(f) for f in batch_files]
+    if FLASHBOTS_OUT.exists():
+        parts.insert(0, pl.read_parquet(FLASHBOTS_OUT))
+    if not parts:
+        sys.exit("No Flashbots data: nothing staged and no local file. Run the sync first.")
 
-    print(f"Consolidating {len(batch_files)} batch files ...", flush=True)
-    df = pl.concat([pl.read_parquet(f) for f in batch_files])
-    df = df.sort("slot").unique(subset=["block_number"], keep="first")
+    df = pl.concat(parts, how="diagonal").sort("slot").unique(subset=["block_number"], keep="first").sort("slot")
+    print(f"Flashbots blocks: {len(df):,}", flush=True)
+    print(f"  slot range:  {df['slot'].min():,} - {df['slot'].max():,}", flush=True)
+    print(f"  block range: {df['block_number'].min():,} - {df['block_number'].max():,}", flush=True)
 
-    print(f"  Total Flashbots blocks: {len(df):,}", flush=True)
-    print(f"  Slot range: {df['slot'].min():,} - {df['slot'].max():,}", flush=True)
-    print(f"  Block range: {df['block_number'].min():,} - {df['block_number'].max():,}", flush=True)
+    tmp = FLASHBOTS_OUT.with_suffix(".parquet.tmp")
+    df.write_parquet(tmp, compression="zstd")
+    tmp.replace(FLASHBOTS_OUT)
+    print(f"  saved -> {FLASHBOTS_OUT}", flush=True)
 
-    df.write_parquet(FLASHBOTS_OUT, compression="zstd")
-    print(f"  Saved -> {FLASHBOTS_OUT}", flush=True)
+    for f in batch_files:
+        f.unlink()
+    if BATCH_DIR.exists() and not any(BATCH_DIR.iterdir()):
+        BATCH_DIR.rmdir()
     return df
 
 
-def augment_xatu(df_flashbots: pl.DataFrame) -> None:
+def augment_xatu(df_flashbots: pl.DataFrame, keep_xatu_table: bool = False) -> None:
     """
-    Union df_blocks_builder (Xatu) with Flashbots blocks not already in Xatu.
-    Deduplicates on block_number; Xatu rows take priority (richer metadata).
+    Union the Xatu table with the Flashbots blocks it does not have. One row per block_number; Xatu rows win
+    because they carry more metadata.
     """
-    print(f"\nLoading Xatu: {XATU_FILE}", flush=True)
+    if not XATU_FILE.exists():
+        sys.exit(f"{XATU_FILE} not found. Run step 1 (01_download_xatu.py) first.")
+    print(f"\nLoading Xatu table: {XATU_FILE}", flush=True)
     df_xatu = pl.read_parquet(XATU_FILE)
-    print(f"  Xatu rows:              {len(df_xatu):,}", flush=True)
+    print(f"  Xatu rows:           {len(df_xatu):,}", flush=True)
 
     xatu_blocks = set(df_xatu["block_number"].to_list())
     df_new = df_flashbots.filter(~pl.col("block_number").is_in(xatu_blocks))
 
-    print(f"  Flashbots total:        {len(df_flashbots):,}", flush=True)
-    print(f"  Already in Xatu:        {len(df_flashbots) - len(df_new):,}", flush=True)
-    print(f"  New blocks to add:      {len(df_new):,}", flush=True)
+    print(f"  Flashbots total:     {len(df_flashbots):,}", flush=True)
+    print(f"  Already in Xatu:     {len(df_flashbots) - len(df_new):,}", flush=True)
+    print(f"  New blocks to add:   {len(df_new):,}", flush=True)
 
     type_casts = [
         pl.col(c).cast(df_xatu[c].dtype)
@@ -225,70 +208,36 @@ def augment_xatu(df_flashbots: pl.DataFrame) -> None:
 
     df_augmented = pl.concat([df_xatu, df_new], how="diagonal").sort("block_number")
 
-    print(f"\n  Augmented total:        {len(df_augmented):,} PBS blocks", flush=True)
+    print(f"\n  Augmented total:     {len(df_augmented):,} PBS blocks", flush=True)
     print(f"  Block range: {df_augmented['block_number'].min():,} - {df_augmented['block_number'].max():,}", flush=True)
 
-    df_augmented.write_parquet(AUGMENTED_OUT, compression="zstd")
+    AUGMENTED_OUT.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AUGMENTED_OUT.with_suffix(".parquet.tmp")
+    df_augmented.write_parquet(tmp, compression="zstd")
+    tmp.replace(AUGMENTED_OUT)
     print(f"  Saved -> {AUGMENTED_OUT}", flush=True)
 
-
-def validate_against_relayscan(df_augmented: pl.DataFrame, day: str = "2022-10-01") -> None:
-    """Spot-check one day against relayscan.io daily stats. day: 'YYYY-MM-DD'."""
-    import datetime
-    d = datetime.date.fromisoformat(day)
-    MERGE_BLOCK = 15_537_393
-    merge_date = datetime.date(2022, 9, 15)
-    days_since = (d - merge_date).days
-    block_lo = MERGE_BLOCK + days_since * 7200
-    block_hi = block_lo + 7200
-
-    n_pbs = df_augmented.filter(pl.col("block_number").is_between(block_lo, block_hi)).height
-
-    url = f"https://relayscan.io/stats/day/{day}/json"
-    try:
-        data = requests.get(url, timeout=10).json()
-        known_total = sum(r["num_payloads"] for r in data.get("relays", []))
-        print(f"\nValidation for {day}:", flush=True)
-        print(f"  relayscan known PBS blocks: {known_total:,}", flush=True)
-        print(f"  Our augmented count:        {n_pbs:,}", flush=True)
-        print(f"  Coverage:                   {n_pbs / known_total:.1%}" if known_total else "  (no relayscan data)", flush=True)
-    except Exception as e:
-        print(f"  Relayscan validation failed: {e}", flush=True)
+    if keep_xatu_table:
+        print(f"  Kept the Xatu-only table (--keep-xatu-table): {XATU_FILE}", flush=True)
+    else:
+        XATU_FILE.unlink()
+        print(f"  Removed the Xatu-only table, no longer needed: {XATU_FILE}", flush=True)
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--step", choices=["1", "2", "3", "all"], default="all")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Sync Flashbots relay data and add it to the Xatu relay table.")
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="seconds between two requests")
+    parser.add_argument("--no-download", action="store_true", help="skip the sync; use the local Flashbots file")
+    parser.add_argument("--keep-xatu-table", action="store_true", help="keep data/interim/df_blocks_builder.parquet")
     args = parser.parse_args()
 
-    run_all = args.step == "all"
-    run_dl = args.step == "1" or run_all
-    run_cons = args.step == "2" or run_all
-    run_aug = args.step == "3" or run_all
-
-    if run_dl:
-        print("=== Step 1: Download Flashbots relay data ===", flush=True)
-        download_flashbots()
-
-    if run_cons:
-        print("\n=== Step 2: Consolidate batch files ===", flush=True)
-        df_flashbots = consolidate_flashbots()
-    elif run_aug:
-        if not FLASHBOTS_OUT.exists():
-            print(f"ERROR: {FLASHBOTS_OUT} not found. Run step 2 first.", flush=True)
-            sys.exit(1)
-        df_flashbots = pl.read_parquet(FLASHBOTS_OUT)
-
-    if run_aug:
-        print("\n=== Step 3: Augment Xatu with Flashbots ===", flush=True)
-        augment_xatu(df_flashbots)
-
-        print("\n=== Validation spot-checks ===", flush=True)
-        df_aug = pl.read_parquet(AUGMENTED_OUT)
-        for d in ["2022-10-01", "2022-11-01", "2023-01-01", "2023-06-01"]:
-            validate_against_relayscan(df_aug, d)
-
+    if not args.no_download:
+        print("=== Sync Flashbots relay data ===", flush=True)
+        sync_flashbots(args.delay)
+    print("\n=== Consolidate ===", flush=True)
+    df_flashbots = consolidate_flashbots()
+    print("\n=== Augment the Xatu table with Flashbots ===", flush=True)
+    augment_xatu(df_flashbots, keep_xatu_table=args.keep_xatu_table)
     print("\nDone.", flush=True)
 
 
