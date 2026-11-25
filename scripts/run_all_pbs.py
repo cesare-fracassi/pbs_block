@@ -74,7 +74,8 @@ def stage_args(stage: str, through: str, extra: list[str]) -> list[str]:
 def run_stage(stage: str, through: str, extra: list[str] | None = None) -> None:
     cmd = [sys.executable, "-u", str(SCRIPTS / STAGE_SCRIPT[stage]), *stage_args(stage, through, extra or [])]
     print(f"\n{'=' * 70}\nSTAGE {stage}: {' '.join(Path(c).name if c == cmd[1] else c for c in cmd[1:])}\n{'=' * 70}", flush=True)
-    rc = subprocess.run(cmd, cwd=REPO_DIR).returncode
+    # UTF-8 output so a table with non-ASCII builder names cannot crash a script on Windows
+    rc = subprocess.run(cmd, cwd=REPO_DIR, env={**os.environ, "PYTHONIOENCODING": "utf-8"}).returncode
     if rc != 0:
         sys.exit(f"STAGE {stage} FAILED with exit code {rc}. Fix the cause and rerun; finished work is kept.")
     print(f"STAGE {stage} OK", flush=True)
